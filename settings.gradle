@@ -1,0 +1,3 @@
+rootProject.name = 'Pull Request Overview for Bitbucket'
+
+include ':app'
