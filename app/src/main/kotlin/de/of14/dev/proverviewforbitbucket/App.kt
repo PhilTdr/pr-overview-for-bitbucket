@@ -4,10 +4,10 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import de.of14.dev.proverviewforbitbucket.model.local.OutputFormat
 import de.of14.dev.proverviewforbitbucket.model.local.OutputFormat.Companion.toOutputFormat
-import de.of14.dev.proverviewforbitbucket.model.local.PrInfo
 import de.of14.dev.proverviewforbitbucket.model.local.ProjectRepo
 import de.of14.dev.proverviewforbitbucket.model.local.TableCell
 import de.of14.dev.proverviewforbitbucket.model.mattermost.MattermostSlashResponseBody
+import de.of14.dev.proverviewforbitbucket.model.mattermost.MattermostUpdateResponseBody
 import de.of14.dev.proverviewforbitbucket.service.BitbucketService
 import de.of14.dev.proverviewforbitbucket.utils.flattenedComments
 import de.of14.dev.proverviewforbitbucket.utils.flattenedWithChildComments
@@ -15,10 +15,12 @@ import de.of14.dev.proverviewforbitbucket.utils.getFirstname
 import io.ktor.application.*
 import io.ktor.features.*
 import io.ktor.http.*
+import io.ktor.request.*
 import io.ktor.response.*
 import io.ktor.routing.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
+import io.ktor.util.pipeline.*
 import okhttp3.OkHttpClient
 import org.slf4j.event.Level
 import java.time.Instant
@@ -44,6 +46,8 @@ private val bitbucketService = BitbucketService(client, gson)
 
 fun main() {
     embeddedServer(Netty, port = 8080) {
+        install(ForwardedHeaderSupport)
+        install(XForwardedHeaderSupport)
         install(CallLogging) {
             level = Level.INFO
         }
@@ -53,36 +57,67 @@ fun main() {
             }
         }
         routing {
-            get(path = "/message") {
-                val output = call.parameters["output"]
-                    .let { it ?: throw BadRequestException("Query parameter 'output' is missing.") }
-                    .toOutputFormat()
-                    ?: throw BadRequestException("Unknown output format '${call.parameters["output"]}'")
-
-                val repos = call.parameters["repos"]
-                    ?.let { ProjectRepo.parse(it) }
-                    ?.let { if (it.isNotEmpty()) it else throw BadRequestException("Could not read information from query parameter 'repos'") }
-                    ?: throw BadRequestException("Query parameter 'repos' is missing.")
-
-                val prs = repos.flatMap { bitbucketService.getPrInfoFromBitbucket(it) }
-
-                when (output) {
-                    OutputFormat.Mattermost -> {
-                        val message = generateMarkdownOutput(prs)
-                        call.respondText(contentType = ContentType.parse("application/json")) {
-                            @Suppress("NAME_SHADOWING") val message = if (message.length < 16383) message
-                            else "There are too many PRs. I gave up. Get your shit together!"
-                            gson.toJson(MattermostSlashResponseBody(text = message))
-                        }
-                    }
-                }
-            }
+            post(path = "/message") { messageGetRequest(this) }
+            get(path = "/message") { messageGetRequest(this) }
+            post(path = "/message/update") { messageUpdateRequest(this) }
+            get(path = "/message/update") { messageUpdateRequest(this) }
         }
     }.start(wait = true)
 }
 
-private fun generateMarkdownOutput(prs: List<PrInfo>): String {
-    if (prs.isEmpty()) return "Failed to read Pull Requests from Bitbucket"
+private suspend fun messageGetRequest(pipelineContext: PipelineContext<Unit, ApplicationCall>) {
+    pipelineContext.run {
+        val output = call.parameters["output"]
+            .let { it ?: throw BadRequestException("Query parameter 'output' is missing.") }
+            .toOutputFormat()
+            ?: throw BadRequestException("Unknown output format '${call.parameters["output"]}'")
+
+        val repos = call.parameters["repos"]
+            ?.let { ProjectRepo.parse(it) }
+            ?.let { if (it.isNotEmpty()) it else throw BadRequestException("Could not read information from query parameter 'repos'") }
+            ?: throw BadRequestException("Query parameter 'repos' is missing.")
+
+        when (output) {
+            OutputFormat.Mattermost -> {
+                call.respondText(contentType = ContentType.parse("application/json")) {
+                    gson.toJson(generateMattermostOutputMessage(call, repos))
+                }
+            }
+        }
+    }
+}
+
+private suspend fun messageUpdateRequest(pipelineContext: PipelineContext<Unit, ApplicationCall>) {
+    pipelineContext.run {
+        val output = call.parameters["output"]
+            .let { it ?: throw BadRequestException("Query parameter 'output' is missing.") }
+            .toOutputFormat()
+            ?: throw BadRequestException("Unknown output format '${call.parameters["output"]}'")
+
+        val repos = call.parameters["repos"]
+            ?.let { ProjectRepo.parse(it) }
+            ?.let { if (it.isNotEmpty()) it else throw BadRequestException("Could not read information from query parameter 'repos'") }
+            ?: throw BadRequestException("Query parameter 'repos' is missing.")
+
+        when (output) {
+            OutputFormat.Mattermost -> {
+                val normalMessage = generateMattermostOutputMessage(call, repos)
+                val updateMessage = MattermostUpdateResponseBody(
+                    update = MattermostUpdateResponseBody.Update(
+                        message = normalMessage.text
+                    )
+                )
+                call.respondText(contentType = ContentType.parse("application/json")) {
+                    gson.toJson(updateMessage)
+                }
+            }
+        }
+    }
+}
+
+private suspend fun generateMattermostOutputMessage(call: ApplicationCall, repos: List<ProjectRepo>): MattermostSlashResponseBody {
+    val prs = repos.flatMap { bitbucketService.getPrInfoFromBitbucket(it) }
+    if (prs.isEmpty()) return MattermostSlashResponseBody(text = "Failed to read Pull Requests from Bitbucket")
 
     val table: String = prs
         .sortedBy { it.value.createdDate }
@@ -241,5 +276,44 @@ private fun generateMarkdownOutput(prs: List<PrInfo>): String {
             | :new: | Unreviewed commits | :grey_question: | Missing Review | :wrench: | Needs Work | :white_check_mark: | Ready to Merge | 
         """.trimIndent()
 
-    return table + "\n\n" + legend
+    val outputMessage = (table + "\n\n" + legend).let {
+        if (it.length < 16383) it
+        else "There are too many PRs. I gave up. Get your shit together!"
+    }
+
+    return MattermostSlashResponseBody(
+        text = outputMessage,
+        attachments = listOf(
+            MattermostSlashResponseBody.Attachment(
+                actions = listOf(
+                    MattermostSlashResponseBody.Attachment.Action(
+                        id = "update",
+                        name = "Update",
+                        integration = MattermostSlashResponseBody.Attachment.Action.Integration(
+                            url = call.request.origin.scheme
+                                    + "://"
+                                    + readServerHost(call)
+                                    + call.request.origin.port.let { if (listOf(80, 443).contains(it)) "" else ":$it" }
+                                    + "/message/update?output=${call.parameters["output"]}&repos=${call.parameters["repos"]}",
+                            context = MattermostSlashResponseBody.Attachment.Action.Integration.Context(
+                                action = "do_update"
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+}
+
+private fun readServerHost(call: ApplicationCall): String {
+    if (call.request.origin.host == call.request.local.host) return call.request.local.host
+    if (call.request.origin.host.contains(".")) return call.request.origin.host
+
+    val hostHeader = call.request.header("X-Forwarded-Host")
+    val serverHeader = call.request.header("X-Forwarded-Server")
+    return if (!hostHeader.isNullOrBlank()
+        && hostHeader.contains(".")
+        && (serverHeader.isNullOrBlank() || !serverHeader.contains("."))
+    ) hostHeader else call.request.origin.host
 }
