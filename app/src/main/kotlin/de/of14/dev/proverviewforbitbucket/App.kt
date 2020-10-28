@@ -20,6 +20,7 @@ import io.ktor.routing.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import okhttp3.OkHttpClient
+import org.slf4j.event.Level
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.temporal.ChronoUnit
@@ -43,6 +44,9 @@ private val bitbucketService = BitbucketService(client, gson)
 
 fun main() {
     embeddedServer(Netty, port = 8080) {
+        install(CallLogging) {
+            level = Level.INFO
+        }
         install(StatusPages) {
             exception<Throwable> { e ->
                 call.respondText(e.localizedMessage, ContentType.Text.Plain, HttpStatusCode.InternalServerError)
